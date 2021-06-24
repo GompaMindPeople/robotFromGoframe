@@ -15,6 +15,7 @@ import (
 	"robotFromGoframe/app/service"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -26,17 +27,23 @@ var DataQueue = gqueue.New(65535)
 
 var HeartbeatQueue = gqueue.New(1000)
 
+var waitGroup = sync.WaitGroup{}
+
 var path = ""
 
+// 指令映射表
 var mapping = map[string]func(content *qc.Content){
 	"help":      help,
 	"quake":     quake,
 	"dirsearch": dirSearch,
+	"oneForall": oneForall,
 }
 
+// 机器人的通信实例.
 var qqClient = service.QQClient{Host: "http://127.0.0.1:5700"}
 
 func init() {
+	//  获取执行文件的绝对路径
 	path, _ = filepath.Abs(filepath.Dir(os.Args[0]))
 	go func() {
 		// 每过3分钟 就清空心跳包的数据...感觉心跳包暂时没用..
@@ -46,6 +53,7 @@ func init() {
 		}
 	}()
 	//处理消息
+	//协程处理 消息
 	go func() {
 		ProcessMessage()
 	}()
@@ -62,20 +70,24 @@ func (*proc) Index(r *ghttp.Request) {
 			HeartbeatQueue.Push(reqBody)
 		}
 	} else {
+
 		result := &model.FriendPrivateMessage{}
+		//非心跳包数据尝试转换成好友消息.
 		err := json.Unmarshal([]byte(reqBody), result)
 		if err != nil {
 			glog.Error("数据转换成好友消息时报错")
 			r.Response.Writeln("数据转换成好友消息时报错")
 		} else {
+			// 压队列
 			DataQueue.Push(result)
 		}
 
 	}
-	r.Response.Writeln("Hello proc!")
+	r.Response.Writeln("ok")
 
 }
 
+// 测试路由
 func (*proc) Message(r *ghttp.Request) {
 	message := SendPrivateMessage("xiaoxi", "894799178")
 	r.Response.Writeln(message.Data)
@@ -94,115 +106,103 @@ func ProcessMessage() {
 				continue
 			}
 			s := message[0:1]
+			//第一个字符是# 表示 该消息是指令
 			if s == "#" {
 				for k, v := range mapping {
 					if strings.Index(message, k) != -1 {
 						v(&qc.Content{Param: pop})
 					}
 				}
-				//SendPrivateMessage("----开始处理请求---",strconv.FormatInt(pop.UserId,10))
-				//strings.Index(s,)
 			}
 
 		}
 	}
 }
 
+//发生私聊消息..
 func SendPrivateMessage(message, qqNumber string) model.ResponseData {
 	return qqClient.SendMessage("private", message, qqNumber, "", false)
 }
 
+// dirsearch工具的指令调用实现
 func dirSearch(content *qc.Content) {
-
 	fm := content.Param.(*model.FriendPrivateMessage)
-
-	//message := parseMessage(fm.Message[len("#dirsearch"):])
-
-	cmd := []string{"cd tools/dirsearch-master", fm.Message[len("#dirsearch")+1:]}
-
-	execute(fm, cmd...)
+	message := parseMessage(fm.Message[len("#dirsearch "):])
+	message[1] = path + "/tools/dirsearch-master/" + message[1]
+	execute(fm, message...)
 
 }
 
-// quake 的主要函数 入口
-func quake(content *qc.Content) {
+// oneForall指令
+func oneForall(content *qc.Content) {
 	fm := content.Param.(*model.FriendPrivateMessage)
 
+	message := parseMessage(fm.Message[len("#oneForall "):])
+	message[1] = path + "/tools/OneForAll-master/" + message[1]
+	execute(fm, message...)
+}
+
+// quake 指令
+func quake(content *qc.Content) {
+	fm := content.Param.(*model.FriendPrivateMessage)
 	replace := strings.Replace(fm.Message, "#quake ", "", -1)
-
-	parseMessage(replace)
-	execute(fm, "/tools/quake/InformationGatheringTool")
-
+	message := parseMessage(replace)
+	newMessage := make([]string, 0)
+	newMessage = append(newMessage, path+"/tools/quake/InformationGatheringTool")
+	for _, v := range message {
+		newMessage = append(newMessage, v)
+	}
+	execute(fm, newMessage...)
 	return
 }
 
 // 帮助的函数入口
 func help(content *qc.Content) {
 
-	help1 := "quake---360网络空间资产测绘工具\n"
+	help1 := "quake---360网络空间资产测绘工具,指令演示:\n #quake -t quake -c \"search domain=baidu.com\"\n\n" +
+		"OnForAll子域名收集工具,指令演示:\n #oneForall python Oneforall.py --target baidu.com run\n\n" +
+		"dirsearch目录遍历工具,指令演示:\n #dirsearch python dirsearch.py -u baidu.com\n\n"
 	id := content.Param.(*model.FriendPrivateMessage).UserId
 	SendPrivateMessage(help1, strconv.FormatInt(id, 10))
 }
 
 // 执行本地指令的函数
 func execute(fm *model.FriendPrivateMessage, cmd ...string) {
-	stdout := &bytes.Buffer{}
+	SendPrivateMessage("开始执行指令!-->>", cmd[0])
 	stderr := &bytes.Buffer{}
 	QQNumber := strconv.FormatInt(fm.UserId, 10)
 	msgChan := make(chan int)
 	// 需要对字符串通过空格进行分割一下.
-	command := exec.Command("dir")
-	command.Stdout = stdout
+	var command *exec.Cmd
+	command = exec.Command(cmd[0], cmd[1:]...)
+	command.Stdout = os.Stdout
 	command.Stderr = stderr
-	pipe, err2 := command.StdinPipe()
-
-	if err2 != nil {
-		log.Println("打开输入流管道失败." + err2.Error())
-		return
-	}
-	if err := command.Start(); err != nil {
-		log.Println(err)
-		return
-	}
-
-	for _, v := range cmd {
-		if _, err22 := pipe.Write([]byte(v)); err22 != nil {
-			log.Println("写入命错误->", err22.Error())
-			continue
-		}
-
-		go func(mChan chan int) {
-		A:
-			for true {
-				time.Sleep(time.Second * 2)
-				SendPrivateMessage(stdout.String(), QQNumber)
-				errString := stderr.String()
-				if errString != "" {
-					time.Sleep(time.Second * 1)
-					SendPrivateMessage(errString, QQNumber)
-				}
-				select {
-				case <-mChan:
-					break A
-				default:
-					stderr.Reset()
-					stdout.Reset()
-					continue
-				}
+	go func(mChan chan int, wait *sync.WaitGroup) {
+	A:
+		for true {
+			time.Sleep(time.Second * 2)
+			errString := stderr.String()
+			if errString != "" {
+				SendPrivateMessage(errString, QQNumber)
 			}
-		}(msgChan)
-		err := command.Wait()
-		msgChan <- 1
-		if err != nil {
-			log.Println(err)
-			return
+			select {
+			case <-mChan:
+				break A
+			default:
+				stderr.Reset()
+				continue
+			}
 		}
+	}(msgChan, &waitGroup)
+	if errC := command.Run(); errC != nil {
+		log.Println("发生错误->", errC.Error())
+		return
 	}
-
+	msgChan <- 1
+	SendPrivateMessage(cmd[0]+"--->执行完成!", QQNumber)
 }
 
 func parseMessage(msg string) []string {
-
 	index := strings.Index(msg, "\"")
 	if index == -1 {
 		return strings.Split(msg, " ")
